@@ -10,7 +10,7 @@ a frametime measurement mode, see the section [Experimental Features](#experimen
 
 ### USAGE:
 
-    $ LD_PRELOAD=path/to/socket_hook.so [enivornment options] target_binary
+    $ LD_PRELOAD=path/to/socket_hook.so [enivronment options] target_binary
 
 
 Environment variables controlling the behavior:
