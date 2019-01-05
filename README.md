@@ -14,6 +14,10 @@ a frametime measurement mode, see the section [Experimental Features](#experimen
 
 
 Environment variables controlling the behavior:
+* 'SH_SOCKET=$mode': limit the socket domains which may be created, were `$mode` may be one of
+   * `none`: no sockets can be created (will break all X11 applications usually)
+   * 'local': only local sockets (`AF_UNIX` and `AF_LOCAL`) may be created
+   * 'all': all sockets may be created (the default)
 * `SH_VERBOSE=$level`: control level of verbosity (0 to 5)
 * `SH_VERBOSE_FILE=$file`: redirect verbose output to `$file` (default is to use
 			   standard error stream), see section [File Names](#file-names)

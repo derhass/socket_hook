@@ -128,6 +128,24 @@ parse_name(char *buf, size_t size, const char *name_template, unsigned int ctx_n
 	buf[pos]=0;
 }
 
+static int
+get_string_idx(const char *str, const char **modes, int default_value, int case_sensitive)
+{
+	int idx;
+
+	if (!str ||!modes) {
+		return default_value;
+	}
+
+	for (idx=0; modes[idx]; idx++) {
+		int cmp=(case_sensitive)?strcmp(modes[idx],str):strcasecmp(modes[idx],str);
+		if (!cmp) {
+			return idx;
+		}
+	}
+	return default_value;
+}
+
 /***************************************************************************
  * MESSAGE OUTPUT                                                          *
  ***************************************************************************/
@@ -295,13 +313,57 @@ dlvsym(void *handle, const char *name, const char *version)
  * SOCKET INTERCEPTION LOGIC                                               *
  ***************************************************************************/
 
+/* the different interception modes */
+typedef enum {
+	SH_SOCKET_UNINITIALIZED=-1, /* only for internal use */
+	/* real modes follow */
+	SH_SOCKET_NONE=0,
+	SH_SOCKET_LOCAL,
+	SH_SOCKET_ALL
+} SH_socket_mode;
+
+static SH_socket_mode
+get_socket_mode(void)
+{
+	static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
+	static SH_socket_mode mode=SH_SOCKET_UNINITIALIZED;
+
+	pthread_mutex_lock(&mutex);
+	if (mode == SH_SOCKET_UNINITIALIZED) {
+		static const char *modes[]={
+			"none",
+			"local",
+			"all",
+			NULL
+		};
+		const char *str = getenv("SH_SOCKET");
+		mode=get_string_idx(str, modes, SH_SOCKET_ALL, 0);
+	}
+	pthread_mutex_unlock(&mutex);
+
+	return mode;
+}
+
 static int
 socket_intercept(int domain, int type, int protocol)
 {
-	if (domain != AF_UNIX && domain != AF_LOCAL) {
-		SH_verbose(SH_MSG_INFO, "rejected socket(%d, %d, %d): non-local\n", domain, type, protocol);
-		set_errno(EACCES);
-		return -1;
+	switch(get_socket_mode()) {
+		case SH_SOCKET_NONE:
+			SH_verbose(SH_MSG_INFO, "rejected socket(%d, %d, %d)\n", domain, type, protocol);
+			set_errno(EACCES);
+			return -1;
+		case SH_SOCKET_LOCAL:
+			if (domain != AF_UNIX && domain != AF_LOCAL) {
+				SH_verbose(SH_MSG_INFO, "rejected socket(%d, %d, %d): non-local\n", domain, type, protocol);
+				set_errno(EACCES);
+				return -1;
+			}
+			break;
+		case SH_SOCKET_ALL:
+			(void)0;
+			break;
+		default:
+			SH_verbose(SH_MSG_ERROR, "invalid SH_SOCKET mode %d\n", get_socket_mode());
 	}
 
 	return SH_socket(domain, type, protocol);
