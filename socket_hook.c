@@ -300,7 +300,7 @@ socket_intercept(int domain, int type, int protocol)
 {
 	if (domain != AF_UNIX && domain != AF_LOCAL) {
 		SH_verbose(SH_MSG_INFO, "rejected socket(%d, %d, %d): non-local\n", domain, type, protocol);
-		set_errno(EPERM);
+		set_errno(EACCES);
 		return -1;
 	}
 
@@ -325,6 +325,7 @@ extern int socket(int domain, int type, int protocol)
 	SH_GET_PTR(socket);
 	if (SH_socket == NULL) {
 		SH_verbose(SH_MSG_ERROR,"socket() can't be reached!\n");
+		set_errno(EINVAL);
 		result=-1;
 	} else {
 		result=socket_intercept(domain, type, protocol);
