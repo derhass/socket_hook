@@ -4,10 +4,6 @@ socket_hook
 Simple tool for Linux/glibc hooking into socket API functions. 
 This is currently only an incomplete stub.
 
-
-There are also some more advanced features, notably a latency limiter and
-a frametime measurement mode, see the section [Experimental Features](#experimental-features) below.
-
 ### USAGE:
 
     $ LD_PRELOAD=path/to/socket_hook.so [enivronment options] target_binary
