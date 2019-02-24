@@ -19,7 +19,7 @@ if [ -r "$DIR"/socket_hook.so ]; then
 	echo using "$DIR"
 	export LD_PRELOAD="$DIR/socket_hook.so":"$LD_PRELOAD"
 	# settings to use
-	export GH_SWAP_MODE=force=1 
+	export SH_SOCKET=local
 	export SH_VERBOSE=100
 	export SH_VERBOSE_FILE='/tmp/socket_hook_%p_%t.txt'
 else	
