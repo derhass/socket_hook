@@ -13,7 +13,10 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
+#define SH_SOCKET_DESC_SIZE	256
 
 /***************************************************************************
  * helpers                                                                 *
@@ -256,6 +259,7 @@ static void *SH_get_interceptor(const char*, SH_resolve_func, const char *);
 static void * (* volatile SH_dlsym)(void *, const char*)=NULL;
 static void * (* volatile SH_dlvsym)(void *, const char*, const char *)=NULL;
 static int (* volatile SH_socket)(int, int, int)=NULL;
+static int (* volatile SH_connect)(int, const struct sockaddr*, socklen_t)=NULL;
 
 /* Resolve an unintercepted symbol via the original dlsym() */
 static void *SH_dlsym_next(const char *name)
@@ -307,6 +311,39 @@ dlvsym(void *handle, const char *name, const char *version)
 	SH_verbose(SH_MSG_DEBUG_INTERCEPTION,"dlvsym(%p, %s, %s) = %p%s\n",handle,name,version,ptr,
 		interceptor?" [intercepted]":"");
 	return ptr;
+}
+
+/***************************************************************************
+ * SOCKET ADDRESSES                                                        *
+ ***************************************************************************/
+
+static int validate_sockaddr(const struct sockaddr *addr, socklen_t addrlen)
+{
+	(void)addr;
+
+	if (addrlen > sizeof(struct sockaddr_storage)) {
+		SH_verbose(SH_MSG_WARNING, "got invalid socket address from application: addrlen %d > max addr len %d\n", (int)addrlen, (int)sizeof(struct sockaddr_storage));
+		return -1;
+	}
+	return 0;
+}
+
+
+/* write human-readbale description of a sockaddr to buf, which must be
+ * at least SH_SOCKET_DESC_SIZE bytes big, and returns buf */
+static char *describe_sockaddr(char *buf, const struct sockaddr *addr, socklen_t addrlen)
+{
+	switch (addr->sa_family) {
+		case AF_INET:
+			snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv4:");
+			break;
+		case AF_INET6:
+			snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv6:");
+			break;
+		default:
+			snprintf(buf, SH_SOCKET_DESC_SIZE, "family=%d len=%d", addr->sa_family,(int)addrlen);
+	}
+	return buf;
 }
 
 /***************************************************************************
@@ -369,6 +406,11 @@ socket_intercept(int domain, int type, int protocol)
 	return SH_socket(domain, type, protocol);
 }
 
+static int connect_intercept(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	return SH_connect(sockfd, addr, addrlen);
+}
+
 /***************************************************************************
  * INTERCEPTED FUNCTIONS: socket API                                       *
  ***************************************************************************/
@@ -393,6 +435,28 @@ extern int socket(int domain, int type, int protocol)
 		result=socket_intercept(domain, type, protocol);
 	}
 	SH_verbose(SH_MSG_DEBUG,"socket(%d,%d,%d) = %d\n",domain, type, protocol, result);
+	return result;
+}
+
+extern int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+{
+	int result;
+	char buf[SH_SOCKET_DESC_SIZE];
+
+	SH_GET_PTR(connect);
+	if (SH_connect == NULL) {
+		SH_verbose(SH_MSG_ERROR,"connect() can't be reached!\n");
+		set_errno(ENETUNREACH);
+		result=-1;
+	} else {
+		if (validate_sockaddr(addr, addrlen)) {
+			set_errno(EAFNOSUPPORT);
+			result=-1;
+		} else {
+			result=connect_intercept(sockfd, addr, addrlen);
+		}
+	}
+	SH_verbose(SH_MSG_DEBUG,"connect(%d,[%s]) = %d\n", sockfd, describe_sockaddr(buf, addr, addrlen), result);
 	return result;
 }
 
@@ -427,6 +491,7 @@ static void* SH_get_interceptor(const char *name, SH_resolve_func query,
 	SH_INTERCEPT(dlsym);
 	SH_INTERCEPT(dlvsym);
 	SH_INTERCEPT(socket);
+	SH_INTERCEPT(connect);
 	return NULL;
 }
 
