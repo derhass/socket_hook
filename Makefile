@@ -4,7 +4,7 @@ ifeq ($(DEBUG), 1)
 CFLAGS += -g
 CPPFLAGS += -Werror
 else
-CFLAGS += -O2
+CFLAGS += -O2 -s
 CPPFLAGS += -DNDEBUG
 endif
 
