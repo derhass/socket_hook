@@ -7,10 +7,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stddef.h>
+#include <string.h>
 #include <ctype.h>
 #include <limits.h>
 #include <errno.h>
 
+#include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -26,6 +29,12 @@ static void
 set_errno(int value)
 {
 	errno=value;
+}
+
+static void
+set_h_errno(int value)
+{
+	h_errno=value;
 }
 
 #if 0
@@ -196,7 +205,7 @@ static void SH_verbose(int level, const char *fmt, ...)
 			output_stream=SH_DEFAULT_OUTPUT_STREAM;
 		stream_initialized=1;
 	}
-	fprintf(output_stream,"GH: ");
+	fprintf(output_stream,"SH: ");
 	va_start(args, fmt);
 	vfprintf(output_stream, fmt, args);
 	va_end(args);
@@ -260,6 +269,14 @@ static void * (* volatile SH_dlsym)(void *, const char*)=NULL;
 static void * (* volatile SH_dlvsym)(void *, const char*, const char *)=NULL;
 static int (* volatile SH_socket)(int, int, int)=NULL;
 static int (* volatile SH_connect)(int, const struct sockaddr*, socklen_t)=NULL;
+static struct hostent * (* volatile SH_gethostbyname)(const char *)=NULL;
+static struct hostent * (* volatile SH_gethostbyname2)(const char *, int)=NULL;
+static struct hostent * (* volatile SH_gethostbyaddr)(const void *, socklen_t, int)=NULL;
+static int (* volatile SH_gethostbyname_r)(const char *, struct hostent *, char *, size_t, struct hostent **, int *);
+static int (* volatile SH_gethostbyname2_r)(const char *, int, struct hostent *, char *, size_t, struct hostent **, int *);
+static int (* volatile SH_gethostbyaddr_r)(const void *, socklen_t, int, struct hostent *, char *, size_t, struct hostent **, int *);
+static int (* volatile SH_getaddrinfo)(const char*, const char*, const struct addrinfo *, struct addrinfo **);
+static int (* volatile SH_getaddrinfo_a)(int, struct gaicb *list[], int, struct sigevent *);
 
 /* Resolve an unintercepted symbol via the original dlsym() */
 static void *SH_dlsym_next(const char *name)
@@ -325,6 +342,30 @@ static int validate_sockaddr(const struct sockaddr *addr, socklen_t addrlen)
 		SH_verbose(SH_MSG_WARNING, "got invalid socket address from application: addrlen %d > max addr len %d\n", (int)addrlen, (int)sizeof(struct sockaddr_storage));
 		return -1;
 	}
+	switch (addr->sa_family)
+	{
+		case AF_INET:
+			if (addrlen < offsetof(struct sockaddr_in,sin_zero)) {
+				SH_verbose(SH_MSG_WARNING, "got invalid socket address from application: IPv4 addrlen %d < %d\n", (int)addrlen, (int)offsetof(struct sockaddr_in,sin_zero));
+				return -1;
+			}
+			if (addrlen != sizeof(struct sockaddr_in)) {
+				SH_verbose(SH_MSG_WARNING, "IPv4 addrlen %d !=  %d\n", (int)addrlen, (int)sizeof(struct sockaddr_in));
+				return 1;
+			}
+			break;
+		case AF_INET6:
+			if (addrlen < offsetof(struct sockaddr_in6,sin6_scope_id)) {
+				SH_verbose(SH_MSG_WARNING, "got invalid socket address from application: IPv6 addrlen %d < %d\n", (int)addrlen, (int)offsetof(struct sockaddr_in6,sin6_scope_id));
+				return -1;
+			}
+			if (addrlen != sizeof(struct sockaddr_in6)) {
+				SH_verbose(SH_MSG_WARNING, "IPv6 addrlen %d !=  %d\n", (int)addrlen, (int)sizeof(struct sockaddr_in6));
+				return 1;
+			}
+			break;
+
+	}
 	return 0;
 }
 
@@ -335,10 +376,35 @@ static char *describe_sockaddr(char *buf, const struct sockaddr *addr, socklen_t
 {
 	switch (addr->sa_family) {
 		case AF_INET:
-			snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv4:");
+			{
+				const struct sockaddr_in *a=(const struct sockaddr_in *)addr;
+				snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv4:%s:%u",
+					inet_ntoa(a->sin_addr),ntohs(a->sin_port));
+			}
 			break;
 		case AF_INET6:
-			snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv6:");
+			{
+				const struct sockaddr_in6 *a=(const struct sockaddr_in6 *)addr;
+				const char *b=(const char*)&a->sin6_addr;
+				snprintf(buf, SH_SOCKET_DESC_SIZE, "IPv6:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%u",
+					b[0],
+					b[1],
+					b[2],
+					b[3],
+					b[4],
+					b[5],
+					b[6],
+					b[7],
+					b[8],
+					b[9],
+					b[10],
+					b[11],
+					b[12],
+					b[13],
+					b[14],
+					b[15],
+					ntohs(a->sin6_port));
+			}
 			break;
 		default:
 			snprintf(buf, SH_SOCKET_DESC_SIZE, "family=%d len=%d", addr->sa_family,(int)addrlen);
@@ -384,6 +450,8 @@ get_socket_mode(void)
 static int
 socket_intercept(int domain, int type, int protocol)
 {
+	int res;
+
 	switch(get_socket_mode()) {
 		case SH_SOCKET_NONE:
 			SH_verbose(SH_MSG_INFO, "rejected socket(%d, %d, %d)\n", domain, type, protocol);
@@ -403,12 +471,128 @@ socket_intercept(int domain, int type, int protocol)
 			SH_verbose(SH_MSG_ERROR, "invalid SH_SOCKET mode %d\n", get_socket_mode());
 	}
 
-	return SH_socket(domain, type, protocol);
+	res=SH_socket(domain, type, protocol);
+	if (res < 0) {
+		SH_verbose(SH_MSG_WARNING, "socket(%d, %d, %d) call failed with %d:%s\n", domain, type, protocol, errno, strerror(errno));
+	}
+	return res;
 }
 
-static int connect_intercept(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+static int connect_intercept(int sockfd, const struct sockaddr *addr, socklen_t addrlen, char *buf)
 {
-	return SH_connect(sockfd, addr, addrlen);
+	int res=SH_connect(sockfd, addr, addrlen);
+	if (res < 0) {
+		if (errno == EINPROGRESS) {
+			SH_verbose(SH_MSG_DEBUG,"connect(%d, [%s]) in progress\n", 
+				errno, describe_sockaddr(buf, addr, addrlen));
+		} else {
+			SH_verbose(SH_MSG_WARNING,"connect(%d, [%s]) call failed with %d:%s\n", 
+				errno, describe_sockaddr(buf, addr, addrlen), strerror(errno));
+		}
+	}
+	return res;
+}
+
+static struct hostent *gethostbyname_intercept(const char *name)
+{
+	struct hostent *res=SH_gethostbyname(name);
+	if (!res) {
+		SH_verbose(SH_MSG_WARNING,"gethostbyname(%s) call failed with %d:%s\n",
+			name, h_errno, hstrerror(h_errno));
+	}
+	return res;
+}
+
+static int gethostbyname_r_intercept(const char *name,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=SH_gethostbyname_r(name, ret, buf, buflen, result, h_errnop);
+	if (res < 0) {
+		if (h_errnop) {
+			SH_verbose(SH_MSG_WARNING,"gethostbyname_r(%s) call failed with %d:%s\n",
+				name, *h_errnop, hstrerror(*h_errnop));
+		} else {
+			SH_verbose(SH_MSG_WARNING,"gethostbyname_r(%s) call failed\n",
+				name);
+		}
+	}
+	return res;
+}
+
+static struct hostent *gethostbyname2_intercept(const char *name, int af)
+{
+	struct hostent *res=SH_gethostbyname2(name, af);
+	if (!res) {
+		SH_verbose(SH_MSG_WARNING,"gethostbyname2(%s, %d) call failed with %d:%s\n",
+			name, af, h_errno, hstrerror(h_errno));
+	}
+	return res;
+}
+
+static int gethostbyname2_r_intercept(const char *name, int af,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=SH_gethostbyname2_r(name, af, ret, buf, buflen, result, h_errnop);
+	if (res < 0) {
+		if (h_errnop) {
+			SH_verbose(SH_MSG_WARNING,"gethostbyname_r(%s, %d) call failed with %d:%s\n",
+				name, af, *h_errnop, hstrerror(*h_errnop));
+		} else {
+			SH_verbose(SH_MSG_WARNING,"gethostbyname_r(%s, %d) call failed\n",
+				name, af);
+		}
+	}
+	return res;
+}
+
+static struct hostent *gethostbyaddr_intercept(const void *addr, socklen_t len, int type)
+{
+	struct hostent *res=SH_gethostbyaddr(addr, len, type);
+	if (!res) {
+		SH_verbose(SH_MSG_WARNING,"gethostbyaddr([...], %d) call failed with %d:%s\n",
+			type, h_errno, hstrerror(h_errno));
+	}
+	return res;
+}
+
+static int gethostbyaddr_r_intercept(const void *addr, socklen_t len, int type,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=SH_gethostbyaddr_r(addr, len, type, ret, buf, buflen, result, h_errnop);
+	if (res < 0) {
+		if (h_errnop) {
+			SH_verbose(SH_MSG_WARNING,"gethostbyaddr_r([...], %d) call failed with %d:%s\n",
+				type, *h_errnop, hstrerror(*h_errnop));
+		} else {
+			SH_verbose(SH_MSG_WARNING,"gethostbyaddr_r([...], %d) call failed\n",
+				type);
+		}
+	}
+	return res;
+}
+
+static int getaddrinfo_intercept(const char *node, const char *service,
+		const struct addrinfo *hints, struct addrinfo **res)
+{
+	int result=SH_getaddrinfo(node, service, hints, res);
+	if (result != 0) {
+		SH_verbose(SH_MSG_WARNING,"getaddrinfo(%s, %s) failed with %d\n",
+			node, service, result);
+	}
+	return result;
+}
+
+static int getaddrinfo_a_intercept(int mode, struct gaicb *list[], int nitems, struct sigevent *sevp)
+{
+	int result=SH_getaddrinfo_a(mode, list, nitems, sevp);
+	if (result != 0) {
+		SH_verbose(SH_MSG_WARNING,"getaddrinfo_a(%d, [...], %d) failed with %d\n",
+			mode, nitems, result);
+	}
+	return result;
 }
 
 /***************************************************************************
@@ -440,26 +624,169 @@ extern int socket(int domain, int type, int protocol)
 
 extern int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
-	int result;
+	int result=-1;
 	char buf[SH_SOCKET_DESC_SIZE];
+
+	if (validate_sockaddr(addr, addrlen) < 0) {
+		SH_verbose(SH_MSG_DEBUG,"connect(%d,[...]) = %d due to invalid addr\n", sockfd, result);
+		set_errno(EAFNOSUPPORT);
+		return result;
+	}
 
 	SH_GET_PTR(connect);
 	if (SH_connect == NULL) {
 		SH_verbose(SH_MSG_ERROR,"connect() can't be reached!\n");
 		set_errno(ENETUNREACH);
-		result=-1;
 	} else {
-		if (validate_sockaddr(addr, addrlen)) {
-			set_errno(EAFNOSUPPORT);
-			result=-1;
-		} else {
-			result=connect_intercept(sockfd, addr, addrlen);
-		}
+		result=connect_intercept(sockfd, addr, addrlen, buf);
 	}
 	SH_verbose(SH_MSG_DEBUG,"connect(%d,[%s]) = %d\n", sockfd, describe_sockaddr(buf, addr, addrlen), result);
 	return result;
 }
 
+extern struct hostent *gethostbyname(const char *name)
+{
+	struct hostent *result=NULL;
+
+	SH_GET_PTR(gethostbyname);
+	if (SH_gethostbyname == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyname() can't be reached!\n");
+		set_h_errno(NO_RECOVERY);
+	} else {
+		result=gethostbyname_intercept(name);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyname(%s) = %p\n", name, result);
+	return result;
+}
+
+extern int gethostbyname_r(const char *name,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=-1;
+
+	if (result) {
+		*result=NULL;
+	}
+	SH_GET_PTR(gethostbyname_r);
+	if (SH_gethostbyname_r == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyname_r() can't be reached!\n");
+		if (h_errnop) {
+			*h_errnop=NO_RECOVERY;
+		}
+	} else {
+		res=gethostbyname_r_intercept(name, ret, buf, buflen, result, h_errnop);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyname_r(%s) = %d\n", name, res);
+	return res;
+}
+
+extern struct hostent *gethostbyname2(const char *name, int af)
+{
+	struct hostent *result=NULL;
+
+	SH_GET_PTR(gethostbyname2);
+	if (SH_gethostbyname2 == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyname2() can't be reached!\n");
+		set_h_errno(NO_RECOVERY);
+	} else {
+		result=gethostbyname2_intercept(name, af);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyname2(%s, %d) = %p\n", name, af, result);
+	return result;
+}
+
+extern int gethostbyname2_r(const char *name, int af,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=-1;
+
+	if (result) {
+		*result=NULL;
+	}
+	SH_GET_PTR(gethostbyname2_r);
+	if (SH_gethostbyname2_r == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyname2_r() can't be reached!\n");
+		if (h_errnop) {
+			*h_errnop=NO_RECOVERY;
+		}
+	} else {
+		res=gethostbyname2_r_intercept(name, af, ret, buf, buflen, result, h_errnop);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyname2_r(%s, %d) = %d\n", name, af, res);
+	return res;
+}
+
+extern struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type)
+{
+	struct hostent *result=NULL;
+
+	SH_GET_PTR(gethostbyaddr);
+	if (SH_gethostbyaddr == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyaddr() can't be reached!\n");
+		set_h_errno(NO_RECOVERY);
+	} else {
+		result=gethostbyaddr_intercept(addr, len, type);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyaddr([...], %d) = %p\n", type, result);
+	return result;
+}
+
+extern int gethostbyaddr_r(const void *addr, socklen_t len, int type,
+		struct hostent *ret, char *buf, size_t buflen,
+		struct hostent **result, int *h_errnop)
+{
+	int res=-1;
+
+	if (result) {
+		*result=NULL;
+	}
+	SH_GET_PTR(gethostbyaddr_r);
+	if (SH_gethostbyaddr_r == NULL) {
+		SH_verbose(SH_MSG_ERROR,"gethosbyaddr_r() can't be reached!\n");
+		if (h_errnop) {
+			*h_errnop=NO_RECOVERY;
+		}
+	} else {
+		res=gethostbyaddr_r_intercept(addr, len, type, ret, buf, buflen, result, h_errnop);
+	}
+	SH_verbose(SH_MSG_DEBUG,"gethosybyaddr_r([...], %d) = %d\n", type, res);
+	return res;
+}
+
+
+extern int getaddrinfo(const char *node, const char *service,
+		const struct addrinfo *hints, struct addrinfo **res)
+{
+	int result=EAI_FAIL;
+
+	if (res) {
+		*res=NULL;
+	}
+	SH_GET_PTR(getaddrinfo);
+	if (SH_getaddrinfo == NULL) {
+		SH_verbose(SH_MSG_ERROR,"getaddrinfo() can't be reached!\n");
+	} else {
+		result=getaddrinfo_intercept(node, service, hints, res);
+	}
+	SH_verbose(SH_MSG_DEBUG,"getaddrinfo(%s, %s) = %d\n", node, service, result);
+	return result;
+}
+
+extern int getaddrinfo_a(int mode, struct gaicb *list[], int nitems, struct sigevent *sevp)
+{
+	int result=EAI_MEMORY;
+
+	SH_GET_PTR(getaddrinfo_a);
+	if (SH_getaddrinfo_a == NULL) {
+		SH_verbose(SH_MSG_ERROR,"getaddrinfo_a() can't be reached!\n");
+	} else {
+		result=getaddrinfo_a_intercept(mode, list, nitems, sevp);
+	}
+	SH_verbose(SH_MSG_DEBUG,"getaddrinfo_a(%d, [...], %d) = %d\n", mode, nitems, result);
+	return result;
+}
 
 /***************************************************************************
  * LIST OF INTERCEPTED FUNCTIONS                                           *
@@ -492,6 +819,14 @@ static void* SH_get_interceptor(const char *name, SH_resolve_func query,
 	SH_INTERCEPT(dlvsym);
 	SH_INTERCEPT(socket);
 	SH_INTERCEPT(connect);
+	SH_INTERCEPT(gethostbyname);
+	SH_INTERCEPT(gethostbyname_r);
+	SH_INTERCEPT(gethostbyname2);
+	SH_INTERCEPT(gethostbyname2_r);
+	SH_INTERCEPT(gethostbyaddr);
+	SH_INTERCEPT(gethostbyaddr_r);
+	SH_INTERCEPT(getaddrinfo);
+	SH_INTERCEPT(getaddrinfo_a);
 	return NULL;
 }
 
